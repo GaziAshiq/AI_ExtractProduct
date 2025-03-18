@@ -50,21 +50,36 @@ class DatabaseManager:
         self._init_db()
 
     def _init_db(self) -> None:
-        """Create tables if they don't exist"""
-        conn = sqlite3.connect(
-            self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        """Create tables if they don't exist and update schema if needed"""
+        conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
         c = conn.cursor()
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS products
-        (id INTEGER PRIMARY KEY AUTOINCREMENT,
-         name TEXT NOT NULL,
-         price REAL NOT NULL,
-         currency TEXT NOT NULL,
-         quantity INTEGER DEFAULT 1,
-         source_text TEXT,
-         model TEXT,
-         extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
-        ''')
+
+        # Check if table exists
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products'")
+        table_exists = c.fetchone()
+
+        if not table_exists:
+            # Create new table with all columns
+            c.execute('''
+            CREATE TABLE products
+            (id INTEGER PRIMARY KEY AUTOINCREMENT,
+             name TEXT NOT NULL,
+             price REAL NOT NULL,
+             currency TEXT NOT NULL,
+             quantity INTEGER DEFAULT 1,
+             source_text TEXT,
+             model TEXT,
+             extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+            ''')
+        else:
+            # Check if model column exists
+            c.execute("PRAGMA table_info(products)")
+            columns = [col[1] for col in c.fetchall()]
+
+            # Add missing columns if needed
+            if 'model' not in columns:
+                c.execute("ALTER TABLE products ADD COLUMN model TEXT")
+
         conn.commit()
         conn.close()
 
@@ -100,16 +115,42 @@ class DatabaseManager:
 
     def get_products(self, limit: int = 50) -> pd.DataFrame:
         """Retrieve products from the database"""
+        conn = None
         try:
             conn = sqlite3.connect(self.db_path)
-            df = pd.read_sql_query(
-                "SELECT id, name, price, currency, quantity, source_text, model, extracted_at FROM products ORDER BY extracted_at DESC LIMIT ?",
-                conn,
-                params=(limit,)
-            )
+
+            # Get column names first to handle missing columns
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(products)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            # Build query based on available columns
+            select_columns = []
+            for col in ["id", "name", "price", "currency", "quantity", "source_text", "model", "extracted_at"]:
+                if col in columns:
+                    select_columns.append(col)
+
+            query = f"SELECT {', '.join(select_columns)} FROM products ORDER BY extracted_at DESC LIMIT ?"
+
+            df = pd.read_sql_query(query, conn, params=(limit,))
+
+            # Add any missing columns with default values
+            for col in ["id", "name", "price", "currency", "quantity", "source_text", "model", "extracted_at"]:
+                if col not in df.columns:
+                    if col == "model":
+                        df[col] = "unknown"
+                    elif col == "extracted_at":
+                        df[col] = datetime.now()
+                    else:
+                        df[col] = ""
+
             return df
+        except Exception as e:
+            st.error(f"Database error: {e}")
+            return pd.DataFrame()
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
 
 # Speech Recognition
@@ -124,23 +165,24 @@ class SpeechProcessor:
         # Adjust the recognizer sensitivity
         r.energy_threshold = 300  # Default is 300
         r.dynamic_energy_threshold = True
-        r.pause_threshold = 1.0  # Wait 1 second of silence to consider the phrase complete
+        r.pause_threshold = 2.0  # Longer pause threshold (seconds)
 
         with st.status("Listening...") as status:
             status.write("Please speak clearly. I'll listen until you pause.")
             with sr.Microphone() as source:
                 # Add ambient noise adjustment
                 r.adjust_for_ambient_noise(source, duration=1)
-                st.info("🎤 Listening... Speak now")
+                st.info("🎤 Recording... (speak and then pause when finished)")
+
                 try:
                     # Increase timeout to allow for longer recordings
-                    audio = r.listen(source, timeout=10, phrase_time_limit=15)
+                    audio = r.listen(source, timeout=15, phrase_time_limit=30)
                     status.update(label="Processing speech...", state="running")
                     text = r.recognize_google(audio)
                     status.update(label="Done!", state="complete")
                     return text
                 except sr.WaitTimeoutError:
-                    st.error("No speech detected. Try again.")
+                    st.error("No speech detected. Please try again.")
                     return None
                 except sr.UnknownValueError:
                     st.error("Could not understand audio. Please speak clearly.")
