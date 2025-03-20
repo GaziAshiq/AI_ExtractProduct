@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional, Union
 import speech_recognition as sr
 from dotenv import load_dotenv
 from openpyxl import Workbook
+from indic_transliteration import sanscript
 
 # Import our extractors from modules
 from api_models.deepseek_client import DeepSeekProductExtractor
@@ -67,6 +68,8 @@ class DatabaseManager:
              price REAL NOT NULL,
              currency TEXT NOT NULL,
              quantity INTEGER DEFAULT 1,
+             quantity_description TEXT,
+             quantity_multiplier REAL DEFAULT 1.0,
              source_text TEXT,
              model TEXT,
              extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
@@ -74,11 +77,11 @@ class DatabaseManager:
         else:
             # Check if model column exists
             c.execute("PRAGMA table_info(products)")
-            columns = [col[1] for col in c.fetchall()]
-
-            # Add missing columns if needed
-            if 'model' not in columns:
-                c.execute("ALTER TABLE products ADD COLUMN model TEXT")
+            # columns = [col[1] for col in c.fetchall()]
+            #
+            # # Add missing columns if needed
+            # if 'model' not in columns:
+            #     c.execute("ALTER TABLE products ADD COLUMN model TEXT")
 
         conn.commit()
         conn.close()
@@ -95,12 +98,14 @@ class DatabaseManager:
         for product in products:
             try:
                 c.execute(
-                    "INSERT INTO products (name, price, currency, quantity, source_text, model) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO products (name, price, currency, quantity, quantity_description, quantity_multiplier, source_text, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         product.get("name", "Unknown Product"),
                         float(product.get("price", 0.0)),
                         product.get("currency", "$"),
                         int(product.get("quantity", 1)),
+                        product.get("quantity_description", ""),
+                        float(product.get("quantity_multiplier", 1.0)),
                         product.get("source_text", ""),
                         product.get("model", "unknown")
                     )
@@ -126,7 +131,11 @@ class DatabaseManager:
 
             # Build query based on available columns
             select_columns = []
-            for col in ["id", "name", "price", "currency", "quantity", "source_text", "model", "extracted_at"]:
+            database_columns = ["id", "name", "price", "currency", "quantity", "quantity_description",
+                                "quantity_multiplier",
+                                "source_text", "model", "extracted_at"]
+
+            for col in database_columns:
                 if col in columns:
                     select_columns.append(col)
 
@@ -135,7 +144,7 @@ class DatabaseManager:
             df = pd.read_sql_query(query, conn, params=(limit,))
 
             # Add any missing columns with default values
-            for col in ["id", "name", "price", "currency", "quantity", "source_text", "model", "extracted_at"]:
+            for col in database_columns:
                 if col not in df.columns:
                     if col == "model":
                         df[col] = "unknown"
@@ -158,38 +167,81 @@ class SpeechProcessor:
     """Handles speech-to-text conversion"""
 
     @staticmethod
-    def speech_to_text() -> Optional[str]:
-        """Convert speech to text using Google's speech recognition API"""
+    def speech_to_text(language: str = "bn-BD") -> Optional[str]:
+        """Convert speech to text using Google's speech recognition API
+        Args:
+            language: Language code (bn-BD for Bengali, en-US for English)
+        Returns:
+            Extracted text in the specified language format, or None if an error occurs
+        """
         r = sr.Recognizer()
 
         # Adjust the recognizer sensitivity
-        r.energy_threshold = 300  # Default is 300
+        r.energy_threshold = 300  # Higher threshold for less noise
         r.dynamic_energy_threshold = True
         r.pause_threshold = 2.0  # Longer pause threshold (seconds)
+        r.phrase_threshold = 0.5  # Minimum length of silence to consider end of phrase
+        r.non_speaking_duration = 1.0  # Additional time after speech ends to ensure completeness
 
-        with st.status("Listening...") as status:
-            status.write("Please speak clearly. I'll listen until you pause.")
-            with sr.Microphone() as source:
-                # Add ambient noise adjustment
-                r.adjust_for_ambient_noise(source, duration=1)
-                st.info("🎤 Recording... (speak and then pause when finished)")
+        # Determine language-specific messages
+        messages = {
+            "bn-BD": {
+                "listen_msg": "অনুগ্রহ করে স্পষ্টভাবে কথা বলুন। শেষ হলে কিছুক্ষণ থামুন।",
+                "adjusting": "🎤 পার্শ্ববর্তী শব্দের জন্য সামঞ্জস্য করা হচ্ছে...",
+                "recording": "🎤 রেকর্ডিং চলছে... কথা বলুন এবং শেষ হলে থামুন",
+                "processing": "কথা প্রক্রিয়াকরণ হচ্ছে...",
+                "done": "সম্পন্ন হয়েছে!",
+                "no_speech": "কোন কথা শনাক্ত হয়নি। আবার চেষ্টা করুন।",
+                "not_understand": "কথা বোঝা যায়নি। স্পষ্টভাবে কথা বলুন।",
+                "service_error": "স্পিচ সার্ভিস ত্রুটি:",
+                "mic_error": "মাইক্রোফোন সমস্যা:"
+            },
+            "en-US": {
+                "listen_msg": "Please speak clearly. Pause when you're finished.",
+                "adjusting": "🎤 Adjusting for background noise...",
+                "recording": "🎤 Recording... speak now and pause when done",
+                "processing": "Processing speech...",
+                "done": "Done!",
+                "no_speech": "No speech detected. Try again.",
+                "not_understand": "Could not understand audio. Please speak clearly.",
+                "service_error": "Speech service error:",
+                "mic_error": "Microphone error:"
+            }
+        }
+        # Get messages for selected language, default to English if not found
+        msg = messages.get(language, messages["en-US"])
 
-                try:
-                    # Increase timeout to allow for longer recordings
-                    audio = r.listen(source, timeout=15, phrase_time_limit=30)
-                    status.update(label="Processing speech...", state="running")
-                    text = r.recognize_google(audio)
-                    status.update(label="Done!", state="complete")
-                    return text
-                except sr.WaitTimeoutError:
-                    st.error("No speech detected. Please try again.")
-                    return None
-                except sr.UnknownValueError:
-                    st.error("Could not understand audio. Please speak clearly.")
-                    return None
-                except sr.RequestError as e:
-                    st.error(f"Speech service error: {e}")
-                    return None
+        try:
+            with st.status("Listening...", expanded=True) as status:
+                status.write(msg["listen_msg"])
+
+                with sr.Microphone() as source:
+                    st.info(msg["adjusting"])
+                    # Adjust for ambient noise with longer duration for better results
+                    r.adjust_for_ambient_noise(source, duration=2)
+                    st.info(msg["recording"])
+
+                    try:
+                        # Increased timeout and phrase_time_limit for longer speech
+                        audio = r.listen(source, timeout=20, phrase_time_limit=60)
+                        status.update(label=msg["processing"], state="running")
+
+                        # Use specified language model for recognition
+                        text = r.recognize_google(audio, language=language)
+                        status.update(label=msg["done"], state="complete")
+                        return text
+
+                    except sr.WaitTimeoutError:
+                        st.error(msg["no_speech"])
+                    except sr.UnknownValueError:
+                        st.error(msg["not_understand"])
+                    except sr.RequestError as e:
+                        st.error(f"{msg['service_error']} {e}")
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+        return None
 
 
 # App UI Components
@@ -277,8 +329,16 @@ class ProductExtractorApp:
                 self._display_products(products)
 
         elif input_method == "Voice":
+            language_option = st.selectbox(
+                "Select language for voice input:",
+                [
+                    "bn-BD",  # Bangla
+                    "en-US"  # English
+                ],
+                format_func=lambda x: "Bangla" if x == "bn-BD" else "English"
+            )
             if st.button("🎤 Record Voice"):
-                text_input = self.speech_processor.speech_to_text()
+                text_input = self.speech_processor.speech_to_text(language=language_option)
 
                 if text_input:
                     st.info(f"Transcribed text: {text_input}")
@@ -304,68 +364,74 @@ class ProductExtractorApp:
             st.info("No records found in the database yet. Extract some products first!")
             return
 
-        if not products_df.empty:
-            # Format the dataframe for display
-            display_df = products_df.copy()
+        # Format the dataframe for display
+        display_df = products_df.copy()
+
+        # Add formatted price column
+        if 'currency' in display_df.columns and 'price' in display_df.columns:
             display_df['formatted_price'] = display_df.apply(
                 lambda row: f"{row['currency']} → {row['price']:.2f}", axis=1
             )
 
-            # Just use # type: ignore comment to silence IDE warnings
-            display_df = display_df[['id', 'name', 'formatted_price', 'quantity',
-                                     'source_text', 'model', 'extracted_at']]  # type: ignore
+        # Select only columns that exist in the dataframe
+        columns_to_display = ["id", "name", "price", "currency", "quantity", "quantity_description",
+                              "quantity_multiplier",
+                              "source_text", "model", "extracted_at"]
+        # existing_columns = [col for col in columns_to_display if col in display_df.columns or col == 'formatted_price']
 
-            # Rename columns for display
-            display_df.columns = ['ID', 'Product', 'Price', 'Quantity', 'Text', 'Model', 'Extracted At']
+        # display_df = display_df[existing_columns]
+        display_df = display_df[columns_to_display]
 
-            st.dataframe(display_df, use_container_width=True)
+        # Don't rename columns - just use what we have
+        st.dataframe(display_df, use_container_width=True)
 
-            # Export options
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Export for Google Sheets"):
-                    try:
-                        csv = products_df.to_csv(index=False, encoding='utf-8')
+        # Export options
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Export as CSV"):
+                try:
+                    csv = products_df.to_csv(index=False, encoding='utf-8')
+                    st.download_button(
+                        label="Download CSV for Google Sheets",
+                        data=csv,
+                        file_name=f"product_extractions{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        help="Import this CSV directly into Google Sheets"
+                    )
+                    st.success("CSV file ready! Click above to download.")
+                except Exception as e:
+                    st.error(f"Error generating CSV file: {e}")
+        with col2:
+            if st.button("Export as Excel"):
+                try:
+                    with st.spinner("Preparing Excel file..."):
+                        buffer = io.BytesIO()
+
+                        # Use pandas to_excel directly with ExcelWriter for more control
+                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                            products_df.to_excel(writer, index=False, sheet_name='Products')
+                            workbook = writer.book
+                            worksheet = writer.sheets['Products']
+
+                            # Auto-adjust column widths
+                            for i, col in enumerate(products_df.columns):
+                                max_len = max(
+                                    products_df[col].astype(str).map(len).max(),
+                                    len(str(col))
+                                ) + 2
+                                worksheet.column_dimensions[chr(65 + i)].width = max_len
+
+                        buffer.seek(0)
+
                         st.download_button(
-                            label="Download CSV for Google Sheets",
-                            data=csv,
-                            file_name=f"product_extractions_for_sheets_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                            help="Import this CSV directly into Google Sheets"
+                            label="Download Excel File",
+                            data=buffer,
+                            # file_name=f"product_extractions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            file_name=f"product_extractions_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
-                        st.success("CSV file ready! Click above to download.")
-                    except Exception as e:
-                        st.error(f"Error generating CSV file: {e}")
-            with col2:
-                if st.button("Export as Excel"):
-                    try:
-                        with st.spinner("Preparing Excel file..."):
-                            buffer = io.BytesIO()
-
-                            # Use pandas to_excel directly with ExcelWriter for more control
-                            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                                products_df.to_excel(writer, index=False, sheet_name='Products')
-                                workbook = writer.book
-                                worksheet = writer.sheets['Products']
-
-                                # Auto-adjust column widths
-                                for i, col in enumerate(products_df.columns):
-                                    max_len = max(
-                                        products_df[col].astype(str).map(len).max(),
-                                        len(str(col))
-                                    ) + 2
-                                    worksheet.column_dimensions[chr(65 + i)].width = max_len
-
-                            buffer.seek(0)
-
-                            st.download_button(
-                                label="Download Excel File",
-                                data=buffer,
-                                file_name=f"product_extractions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
-                    except Exception as e:
-                        st.error(f"Error generating Excel file: {e}")
+                except Exception as e:
+                    st.error(f"Error generating Excel file: {e}")
 
     def run(self) -> None:
         """Run the main application"""
@@ -382,7 +448,6 @@ class ProductExtractorApp:
             self.render_database_tab()
 
 
-# Main application entry point
 if __name__ == "__main__":
     app = ProductExtractorApp()
     app.run()
